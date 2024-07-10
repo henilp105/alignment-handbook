@@ -1,3 +1,9 @@
+```
+pip install trl==0.8.2 # till the bug is not fixed: https://github.com/huggingface/alignment-handbook/issues/178
+
+ACCELERATE_LOG_LEVEL=info accelerate launch --config_file recipes/accelerate_configs/fsdp_qlora.yaml --num_processes=2 scripts/run_sft.py recipes/zephyr-7b-beta/sft/config_qlora.yaml --torch_dtype=bfloat16 --bnb_4bit_quant_storage=bfloat16
+```
+
 <p align="center">
   <img src="https://raw.githubusercontent.com/huggingface/alignment-handbook/main/assets/handbook.png">
 </p>
