@@ -1,0 +1,255 @@
+22a23
+> import os
+27c28
+< from transformers import AutoModelForCausalLM, set_seed
+---
+> from transformers import set_seed
+29,43c30,72
+< from alignment import (
+<     DataArguments,
+<     H4ArgumentParser,
+<     ModelArguments,
+<     SFTConfig,
+<     apply_chat_template,
+<     decontaminate_humaneval,
+<     get_checkpoint,
+<     get_datasets,
+<     get_kbit_device_map,
+<     get_peft_config,
+<     get_quantization_config,
+<     get_tokenizer,
+< )
+< from trl import SFTTrainer, setup_chat_format
+---
+> # sys.path.insert(1, '/data/mantas_mazeika/projects/2023/red_teaming_benchmark/redbench/adv_training/trainer_code/alignment-handbook/src') # TODO: fix this path
+> from src.alignment import DataArguments, H4ArgumentParser, ModelArguments, SFTConfig, apply_chat_template, get_datasets, get_kbit_device_map, get_peft_config, get_quantization_config, get_tokenizer
+> from trl import SFTTrainer
+> 
+> from adv_training_utils import CustomSFTTrainer, get_test_case_wrapping
+> import csv
+> import json
+> import time
+> from datasets import Dataset
+> from datasets import concatenate_datasets
+> import uuid
+> 
+> # ADV TRAINING ARGS
+> NUM_GCG_STEPS = 5  # The number of steps to run GCG for when updating a test case
+> GCG_SEARCH_WIDTH = 512  # The search_width argument in GCG
+> NUM_ACCELERATE_GPUS = 2  # Number of GPUs; must match the `num_processes` field in `recipes/accelerate_configs/deepspeed_config.yaml`
+> NUM_TEST_CASES_TO_UPDATE_PER_STEP = 8  # Number of test cases to update in each batch (not counting grad accumulation); must be a multiple of NUM_ACCELERATE_GPUS
+> NUM_SINGLE_BEHAVIOR_TEST_CASES = 8  # Number of test cases in the pool; we sample from these in each batch, then update and train on the sampled test cases
+> SAVE_EVERY = 100  # Frequency of saving checkpoints
+> RESET_EVERY = 50  # Frequency of resetting the pool of test cases
+> 
+> # DATA LOADING ARGS (shouldn't need to modify that much)
+> harmbench_root_dir = '../../'  # This should point to the root directory of the HarmBench repository
+> 
+> behaviors_path = os.path.join(harmbench_root_dir, 'data', 'adv_training_behaviors.csv')
+> with open(behaviors_path, 'r') as csvfile:
+>     reader = csv.DictReader(csvfile)
+>     behaviors = list(reader)
+> 
+> behavior_id_to_target_path = os.path.join(harmbench_root_dir, 'data', 'adv_training_targets.json')
+> with open(behavior_id_to_target_path) as json_file:
+>     behavior_id_to_target = json.load(json_file)
+> torch.backends.cuda.enable_mem_efficient_sdp(False)
+> torch.backends.cuda.enable_flash_sdp(False)
+> 
+> # behaviors_path = os.path.join(harmbench_root_dir, 'data', 'behavior_datasets', 'harmbench_behaviors_text_val.csv')
+> # with open(behaviors_path, 'r') as csvfile:
+> #     reader = csv.DictReader(csvfile)
+> #     behaviors_extra = list(reader)
+> 
+> # behavior_id_to_target_path = os.path.join(harmbench_root_dir, 'data', 'optimizer_targets', 'extra_targets', 'adv_training_val_targets.json')
+> # with open(behavior_id_to_target_path) as json_file:
+> #     behavior_id_to_target_extra = json.load(json_file)
+44a74,75
+> # behaviors.extend(behaviors_extra)
+> # behavior_id_to_target.update(behavior_id_to_target_extra)
+45a77
+> # TRAINING CODE
+71c103
+<     # Log on each process a small summary
+---
+>     # Log on ealso write a lot ach process a small summary
+80,84d111
+<     # Check for last checkpoint
+<     last_checkpoint = get_checkpoint(training_args)
+<     if last_checkpoint is not None and training_args.resume_from_checkpoint is None:
+<         logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
+< 
+88,93c115
+<     raw_datasets = get_datasets(
+<         data_args,
+<         splits=data_args.dataset_splits,
+<         configs=data_args.dataset_configs,
+<         columns_to_keep=["messages", "chosen", "rejected", "prompt", "completion", "label"],
+<     )
+---
+>     raw_datasets = get_datasets(data_args, splits=data_args.dataset_splits)
+97c119,136
+<     column_names = list(raw_datasets["train"].features)
+---
+> 
+>     # with open('merged_robust_45krefusing_v1_1_4_requests_only.json', 'r') as file:
+>     #     additional_data = json.load(file)
+> 
+>     # dataset_dict = {'prompt': [], 'prompt_id': [], 'messages': []}
+> 
+>     # for item in additional_data:
+>     #     dataset_dict['prompt'].append(item['prompt'])
+>     #     messages = [{'content': item['prompt'], 'role': 'user'},{'content': item['refusing'], 'role': 'assistant'}]
+>     #     dataset_dict['messages'].append(messages)
+>     #     dataset_dict['prompt_id'].append(str(uuid.uuid4()))
+> 
+>     # # Now dataset_dict is in the correct format to be passed to Dataset.from_dict()
+>     # additional_dataset = Dataset.from_dict(dataset_dict)
+>     # logger.info(f"====== len(raw_datasets['train']): {len(raw_datasets['train'])}")
+>     # raw_datasets['train'] = concatenate_datasets([raw_datasets['train'], additional_dataset])
+>     # logger.info(f"====== len(raw_datasets['train']): {len(raw_datasets['train'])}")
+> 
+103a143,155
+>     before_tc, after_tc = get_test_case_wrapping(tokenizer)
+> 
+>     #####################
+>     # Apply chat template
+>     #####################
+>     raw_datasets = raw_datasets.map(apply_chat_template, fn_kwargs={"tokenizer": tokenizer, "task": "sft"})
+>     train_dataset = raw_datasets["train"]
+>     eval_dataset = raw_datasets["test"]
+> 
+>     with training_args.main_process_first(desc="Log a few random samples from the processed training set"):
+>         for index in random.sample(range(len(raw_datasets["train"])), 3):
+>             logger.info(f"Sample {index} of the processed training set:\n\n{raw_datasets['train'][index]['text']}")
+> 
+122,162c174
+< 
+<     model = model_args.model_name_or_path
+<     torch.backends.cuda.enable_mem_efficient_sdp(False)
+<     torch.backends.cuda.enable_flash_sdp(False)
+<     # For ChatML we need to add special tokens and resize the embedding layer
+<     if "<|im_start|>" in tokenizer.chat_template and "gemma-tokenizer-chatml" not in tokenizer.name_or_path:
+<         model = AutoModelForCausalLM.from_pretrained(model_args.model_name_or_path, **model_kwargs)
+<         model, tokenizer = setup_chat_format(model, tokenizer)
+<         model_kwargs = None
+< 
+<     #####################
+<     # Apply chat template
+<     #####################
+<     raw_datasets = raw_datasets.map(
+<         apply_chat_template,
+<         fn_kwargs={
+<             "tokenizer": tokenizer,
+<             "task": "sft",
+<             "auto_insert_empty_system_msg": data_args.auto_insert_empty_system_msg,
+<         },
+<         num_proc=data_args.preprocessing_num_workers,
+<         remove_columns=column_names,
+<         desc="Applying chat template",
+<     )
+< 
+<     ##########################
+<     # Decontaminate benchmarks
+<     ##########################
+<     num_raw_train_samples = len(raw_datasets["train"])
+<     raw_datasets = raw_datasets.filter(decontaminate_humaneval, batched=True, batch_size=10_000, num_proc=1)
+<     num_filtered_train_samples = num_raw_train_samples - len(raw_datasets["train"])
+<     logger.info(
+<         f"Decontaminated {num_filtered_train_samples} ({num_filtered_train_samples/num_raw_train_samples * 100:.2f}%) samples from the training set."
+<     )
+< 
+<     train_dataset = raw_datasets["train"]
+<     eval_dataset = raw_datasets["test"]
+< 
+<     with training_args.main_process_first(desc="Log a few random samples from the processed training set"):
+<         for index in random.sample(range(len(raw_datasets["train"])), 3):
+<             logger.info(f"Sample {index} of the processed training set:\n\n{raw_datasets['train'][index]['text']}")
+---
+>     logger.info("*** Model loaded! ***")
+167,168c179,192
+<     trainer = SFTTrainer(
+<         model=model,
+---
+>     trainer = CustomSFTTrainer(
+>         behaviors,
+>         behavior_id_to_target,
+>         before_tc=before_tc,
+>         after_tc=after_tc,
+>         num_gcg_steps=NUM_GCG_STEPS,
+>         gcg_search_width=GCG_SEARCH_WIDTH,
+>         num_test_cases_to_update_per_step=NUM_TEST_CASES_TO_UPDATE_PER_STEP,
+>         num_accelerate_gpus=NUM_ACCELERATE_GPUS,
+>         num_single_behavior_test_cases=NUM_SINGLE_BEHAVIOR_TEST_CASES,
+>         num_multi_behavior_test_cases=10,  # Unsupported
+>         save_every=SAVE_EVERY,
+>         reset_every=RESET_EVERY,
+>         model=model_args.model_name_or_path,
+178d201
+<         dataset_kwargs=training_args.dataset_kwargs,
+185,190c208
+<     checkpoint = None
+<     if training_args.resume_from_checkpoint is not None:
+<         checkpoint = training_args.resume_from_checkpoint
+<     elif last_checkpoint is not None:
+<         checkpoint = last_checkpoint
+<     train_result = trainer.train(resume_from_checkpoint=checkpoint)
+---
+>     train_result = trainer.train()
+192c210,211
+<     metrics["train_samples"] = len(train_dataset)
+---
+>     max_train_samples = data_args.max_train_samples if data_args.max_train_samples is not None else len(train_dataset)
+>     metrics["train_samples"] = min(max_train_samples, len(train_dataset))
+196a216,226
+>     ##########
+>     # Evaluate
+>     ##########
+>     if training_args.do_eval:
+>         logger.info("*** Evaluate ***")
+>         metrics = trainer.evaluate()
+>         max_eval_samples = data_args.max_eval_samples if data_args.max_eval_samples is not None else len(eval_dataset)
+>         metrics["eval_samples"] = min(max_eval_samples, len(eval_dataset))
+>         trainer.log_metrics("eval", metrics)
+>         trainer.save_metrics("eval", metrics)
+> 
+205,211c235,242
+<     kwargs = {
+<         "finetuned_from": model_args.model_name_or_path,
+<         "dataset": list(data_args.dataset_mixer.keys()),
+<         "dataset_tags": list(data_args.dataset_mixer.keys()),
+<         "tags": ["alignment-handbook"],
+<     }
+<     if trainer.accelerator.is_main_process:
+---
+>     accelerator = trainer.accelerator
+>     if accelerator.is_main_process:
+>         kwargs = {
+>             "finetuned_from": model_args.model_name_or_path,
+>             "dataset": list(data_args.dataset_mixer.keys()),
+>             "dataset_tags": list(data_args.dataset_mixer.keys()),
+>             "tags": ["alignment-handbook"],
+>         }
+217,229c248,250
+<     ##########
+<     # Evaluate
+<     ##########
+<     if training_args.do_eval:
+<         logger.info("*** Evaluate ***")
+<         metrics = trainer.evaluate()
+<         metrics["eval_samples"] = len(eval_dataset)
+<         trainer.log_metrics("eval", metrics)
+<         trainer.save_metrics("eval", metrics)
+< 
+<     if training_args.push_to_hub is True:
+<         logger.info("Pushing to hub...")
+<         trainer.push_to_hub(**kwargs)
+---
+>         if training_args.push_to_hub is True:
+>             logger.info("Pushing to hub...")
+>             trainer.push_to_hub()
+231c252,253
+<     logger.info("*** Training complete ***")
+---
+>     accelerator.wait_for_everyone()
+>     accelerator.end_training()
